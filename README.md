@@ -30,7 +30,7 @@ export GH_TOKEN=TOKEN_HERE
 
 ```bash
 mkdir -p ~/aio-toolkit && \
-curl -fsSL -H "Authorization: Bearer $GH_TOKEN" https://raw.githubusercontent.com/alpinezx/linux-aio-script/refs/heads/main/aio-toolkit.sh -o ~/aio-toolkit/aio-toolkit.sh && \
+curl -fsSL -H "Authorization: Bearer $GH_TOKEN" https://raw.githubusercontent.com/alpinezx/linux-aio-toolkit/refs/heads/main/aio-toolkit.sh -o ~/aio-toolkit/aio-toolkit.sh && \
 cd ~/aio-toolkit && sudo bash aio-toolkit.sh
 ```
 
