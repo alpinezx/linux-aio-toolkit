@@ -16,21 +16,9 @@ A single interactive script bundling common Ubuntu/Debian VPS setup and maintena
 
 ## Quick start
 
-> 🔒 This repo is currently private. Export a GitHub token with read access first, then enter the export token into the terminal. You probably saved this somewhere safe like your password manager or file.
-
-```bash
-export GH_TOKEN=TOKEN_HERE
-```
-
-> 💡 **Don't want to re-export it every new session?** Add it to your shell profile instead:
-> ```bash
-> echo 'export GH_TOKEN=TOKEN_HERE' >> ~/.bashrc && chmod 600 ~/.bashrc && source ~/.bashrc
-> ```
-> ⚠️ This writes the token to disk in plaintext on the server, readable by any account with access to `~/.bashrc`. Only do this on a server you trust and control, and rotate the token periodically.
-
 ```bash
 mkdir -p ~/aio-toolkit && \
-curl -fsSL -H "Authorization: Bearer $GH_TOKEN" https://raw.githubusercontent.com/alpinezx/linux-aio-toolkit/refs/heads/main/aio-toolkit.sh -o ~/aio-toolkit/aio-toolkit.sh && \
+curl -fsSL https://raw.githubusercontent.com/alpinezx/linux-aio-toolkit/refs/heads/main/aio-toolkit.sh -o ~/aio-toolkit/aio-toolkit.sh && \
 cd ~/aio-toolkit && sudo bash aio-toolkit.sh
 ```
 
