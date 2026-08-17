@@ -5,7 +5,7 @@
 A single interactive script bundling common Ubuntu/Debian VPS setup and maintenance tasks — the stuff you'd otherwise do by hand every time you log into a fresh server, or hunt down in a pile of separate one-off scripts.
 
 > **⚠️ Compatibility notice**
-> This toolkit is tested end-to-end only on **Ubuntu 24.04 LTS**. It has *not* been verified on Debian (12/13) or other Ubuntu releases (e.g. 26.04) yet. Most modules are plain `apt`/`systemd` operations likely to work fine elsewhere — but the **DNS-over-TLS** module specifically relies on Ubuntu-specific behavior (netplan, systemd-networkd) that may not exist or may work differently on other distros/versions. That module checks its own compatibility at runtime and will warn and ask for confirmation before running on anything outside its tested list — see [Safety design](#safety-design).
+> This toolkit is tested end-to-end only on **Ubuntu Server 24.04 LTS**. It has *not* been verified on Debian (12/13) or other Ubuntu releases (e.g. 26.04) yet. Most modules are plain `apt`/`systemd` operations likely to work fine elsewhere — but the **DNS-over-TLS** module specifically relies on Ubuntu-specific behavior (netplan, systemd-networkd) that may not exist or may work differently on other distros/versions. That module checks its own compatibility at runtime and will warn and ask for confirmation before running on anything outside its tested list — see [Safety design](#safety-design).
 >
 > Use on other distros/versions at your own risk. PRs adding verified support for additional OS/version combos are welcome.
 
@@ -18,7 +18,7 @@ A single interactive script bundling common Ubuntu/Debian VPS setup and maintena
 
 ## Prerequisites
 
-- A fresh Ubuntu or Debian VPS (tested on Ubuntu 24.04 LTS; should work on other Debian-based distros, but paths/behavior may differ slightly — see the compatibility notice above)
+- A fresh Ubuntu or Debian VPS (tested on Ubuntu Server 24.04 LTS; should work on other Debian-based distros, but paths/behavior may differ slightly — see the compatibility notice above)
 - Root access, or a sudo-capable user
 
 ## Quick start
