@@ -88,3 +88,7 @@ This isn't just confirmation prompts everywhere — a few things are worth knowi
 
 - If a module reports it "did not fully complete," scroll up — every module prints its own specific error before returning, rather than failing silently.
 - SSH-related options always tell you to test in a **new terminal window** before closing your current session. Follow that instruction literally — it's the difference between a mistake being a two-second fix and a full server rebuild.
+
+## License
+
+MIT — see [LICENSE](./LICENSE). Provided as-is, no warranty; you're responsible for your own server, keys, and data.
