@@ -1,5 +1,7 @@
 # Linux AIO Toolkit
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+
 A single interactive script bundling common Ubuntu/Debian VPS setup and maintenance tasks — the stuff you'd otherwise do by hand every time you log into a fresh server, or hunt down in a pile of separate one-off scripts.
 
 > **⚠️ Compatibility notice**
