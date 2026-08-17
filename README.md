@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
-A single interactive script bundling common Ubuntu/Debian VPS setup and maintenance tasks — the stuff you'd otherwise do by hand every time you log into a fresh server, or hunt down in a pile of separate one-off scripts.
+A single interactive script bundling common Ubuntu/Debian Server VPS setup and maintenance tasks — the stuff you'd otherwise do by hand every time you log into a fresh server, or hunt down in a pile of separate one-off scripts.
 
 > **⚠️ Compatibility notice**
 > This toolkit is tested end-to-end only on **Ubuntu Server 24.04 LTS**. It has *not* been verified on Debian (12/13) or other Ubuntu releases (e.g. 26.04) yet. Most modules are plain `apt`/`systemd` operations likely to work fine elsewhere — but the **DNS-over-TLS** module specifically relies on Ubuntu-specific behavior (netplan, systemd-networkd) that may not exist or may work differently on other distros/versions. That module checks its own compatibility at runtime and will warn and ask for confirmation before running on anything outside its tested list — see [Safety design](#safety-design).
