@@ -1171,6 +1171,360 @@ enable_bbr() {
 }
 
 # ============================================================
+# ---------- module: DNS-over-TLS (encrypted DNS) ----------
+# Switches the host's DNS resolution to DNS-over-TLS, so provider- or
+# datacenter-assigned resolvers (e.g. a cloud host's metadata-service DNS
+# proxy) are never used, and queries are encrypted end-to-end. Touches two
+# places, verified by hand before this module was written:
+#   - /etc/systemd/resolved.conf   (DNS=, FallbackDNS=, DNSOverTLS=yes)
+#   - /etc/netplan/*.yaml          (nameservers: + dhcp4-overrides.use-dns:
+#                                    false, so DHCP-supplied DNS is never
+#                                    even registered, not just overridden)
+# Netplan is rewritten from a template rather than patched in place - YAML's
+# indentation makes surgical edits fragile. The interface's existing lines
+# (match/macaddress, mtu, set-name, dhcp4, etc.) are extracted and preserved
+# as-is; only nameservers:/dhcp4-overrides: are added or replaced.
+# ============================================================
+
+# Built-in provider pairs. Picking one uses the OTHER built-in provider as
+# fallback, so primary and fallback are always two different operators -
+# never two servers from the same company.
+_DNS_CLOUDFLARE_IP1="1.1.1.1"; _DNS_CLOUDFLARE_IP2="1.0.0.1"; _DNS_CLOUDFLARE_HOST="cloudflare-dns.com"
+_DNS_QUAD9_IP1="9.9.9.9"; _DNS_QUAD9_IP2="149.112.112.112"; _DNS_QUAD9_HOST="dns.quad9.net"
+
+# Finds the netplan YAML file this module should edit. Errors out rather
+# than guessing if there's more than one, or none - ambiguous which is live.
+_dns_netplan_file() {
+    local files=(/etc/netplan/*.yaml)
+    if [[ ! -e "${files[0]}" ]]; then
+        warn "No netplan YAML file found under /etc/netplan/ - skipping netplan changes."
+        warn "(Expected on non-Ubuntu hosts. /etc/systemd/resolved.conf is still updated, so DNS"
+        warn "changes apply now - but without netplan there's nothing here stopping DHCP from"
+        warn "re-asserting its own DNS on this interface later, e.g. on the next reboot.)"
+        return 1
+    fi
+    if [[ ${#files[@]} -gt 1 ]]; then
+        warn "Multiple netplan files found under /etc/netplan/: ${files[*]}"
+        warn "Not guessing which is live - edit netplan manually, or remove the extras first."
+        return 1
+    fi
+    echo "${files[0]}"
+}
+
+# Rewrites the given netplan file's first ethernet interface block so that:
+#   - dhcp4-overrides: use-dns: false   (DHCP-supplied DNS never registered)
+#   - nameservers: addresses: [...]     (explicit resolver list)
+# Any other keys already on that interface (match/macaddress, mtu, set-name,
+# dhcp4, etc.) are preserved exactly as they were. Idempotent: any
+# nameservers:/dhcp4-overrides: block from a PREVIOUS run of this module is
+# stripped before the block is rebuilt, so re-running never duplicates them.
+# Prints the interface name on success (used by the caller to clear its
+# live resolver cache immediately, rather than waiting for a reboot).
+# Extracts the interface name from the first entry under 'ethernets:' in a
+# netplan YAML file. Shared by the writer (below) and by restore, so both
+# agree on which interface DNS actually applies to. Uses literal space
+# counts, not [:space:]{n} interval regex - Ubuntu's default /usr/bin/awk is
+# mawk, which doesn't support interval quantifiers without a non-default flag.
+_dns_detect_iface() {
+    local file="$1"
+    awk '
+        /^  ethernets:/ { in_eth=1; next }
+        in_eth && /^    [A-Za-z0-9_.-]+:/ {
+            line=$0; gsub(/^[ ]+/,"",line); gsub(/:.*$/,"",line); print line; exit
+        }
+    ' "$file"
+}
+
+_dns_write_netplan() {
+    local file="$1" ip1="$2" ip2="$3"
+    local pristine="${file}.pre-dns-toolkit"
+    [[ -f "$pristine" ]] || cp "$file" "$pristine"
+    local backup="${file}.bak.$(date +%Y%m%d%H%M%S)"
+    cp "$file" "$backup"
+
+    local iface
+    iface=$(_dns_detect_iface "$file")
+    [[ -n "$iface" ]] || { warn "Could not find an interface under 'ethernets:' in $file - leaving it untouched."; return 1; }
+
+    local existing_lines
+    existing_lines=$(awk -v iface="$iface" '
+        BEGIN { in_iface=0; skip=0 }
+        $0 ~ "^    "iface":" { in_iface=1; next }
+        in_iface && /^    [A-Za-z0-9_.-]+:/ { in_iface=0 }
+        in_iface {
+            if ($0 ~ /^      (nameservers|dhcp4-overrides):/) { skip=1; next }
+            if (skip) {
+                if ($0 ~ /^        /) next
+                skip=0
+            }
+            print
+        }
+    ' "$file")
+
+    {
+        echo "network:"
+        echo "  version: 2"
+        echo "  ethernets:"
+        echo "    ${iface}:"
+        [[ -n "$existing_lines" ]] && printf '%s\n' "$existing_lines"
+        echo "      dhcp4-overrides:"
+        echo "        use-dns: false"
+        echo "      nameservers:"
+        echo "        addresses: [${ip1}, ${ip2}]"
+    } > "$file"
+
+    echo "$iface"
+}
+
+# Sets DNS=/FallbackDNS=/DNSOverTLS=yes in /etc/systemd/resolved.conf.
+# Replaces any existing LIVE (uncommented) line for each key; otherwise
+# inserts a new line right after the [Resolve] header. The stock file's
+# commented example lines are left untouched either way - only real, active
+# keys are ever modified.
+_dns_write_resolved_conf() {
+    local dns_line="$1" fallback_line="$2"
+    local file="/etc/systemd/resolved.conf"
+    local pristine="${file}.pre-dns-toolkit"
+    [[ -f "$pristine" ]] || cp "$file" "$pristine"
+    local backup="${file}.bak.$(date +%Y%m%d%H%M%S)"
+    cp "$file" "$backup"
+
+    grep -q '^\[Resolve\]' "$file" || { warn "No [Resolve] section found in $file - aborting DNS changes."; return 1; }
+
+    local key value
+    for pair in "DNS=$dns_line" "FallbackDNS=$fallback_line" "DNSOverTLS=yes"; do
+        key="${pair%%=*}"
+        value="${pair#*=}"
+        [[ "$key" == "FallbackDNS" && -z "$value" ]] && continue
+        if grep -q "^${key}=" "$file"; then
+            sed -i "s|^${key}=.*|${key}=${value}|" "$file"
+        else
+            sed -i "/^\[Resolve\]/a ${key}=${value}" "$file"
+        fi
+    done
+}
+
+# Restores /etc/systemd/resolved.conf and the netplan file to whatever they
+# were BEFORE this module ever touched them (the "pre-dns-toolkit" copy,
+# saved once on first use - not the per-switch timestamped backups, which
+# would just restore the previous provider instead of the true original).
+restore_default_dns() {
+    info "Restoring original (pre-toolkit) DNS configuration"
+    local resolved_file="/etc/systemd/resolved.conf"
+    local resolved_pristine="${resolved_file}.pre-dns-toolkit"
+    local nfile pristine_net restored_any=false
+
+    if [[ -f "$resolved_pristine" ]]; then
+        cp "$resolved_pristine" "$resolved_file"
+        echo "Restored $resolved_file from its pre-toolkit backup."
+        restored_any=true
+    else
+        echo "No pre-toolkit backup found for $resolved_file - this module may never have changed it."
+    fi
+
+    if nfile=$(_dns_netplan_file); then
+        pristine_net="${nfile}.pre-dns-toolkit"
+        if [[ -f "$pristine_net" ]]; then
+            cp "$pristine_net" "$nfile"
+            echo "Restored $nfile from its pre-toolkit backup."
+            restored_any=true
+        else
+            echo "No pre-toolkit backup found for $nfile - this module may never have changed it."
+        fi
+    fi
+
+    if [[ "$restored_any" == false ]]; then
+        warn "Nothing to restore - DNS-over-TLS doesn't appear to have been set up yet."
+        return 1
+    fi
+
+    read -rp "Apply the restored config now (netplan apply + restart systemd-resolved)? [Y/n]: " CONFIRM_RESTORE
+    CONFIRM_RESTORE="${CONFIRM_RESTORE:-Y}"
+    if [[ ! "$CONFIRM_RESTORE" =~ ^[Yy]$ ]]; then
+        warn "Files restored but not applied. Run 'netplan apply' and 'systemctl restart systemd-resolved' manually, or re-run this option."
+        return 0
+    fi
+
+    netplan apply || warn "netplan apply reported an issue - check the output above."
+
+    # Restoring the netplan file removes our explicit nameservers/
+    # dhcp4-overrides block, but that alone doesn't make DHCP-assigned DNS
+    # (whatever the provider hands out) show up again - confirmed by hand:
+    # neither a lone interface down/up cycle nor restarting systemd-resolved
+    # on its own was enough. This is a known systemd-networkd quirk (DNS
+    # info from a live lease renewal doesn't reliably get pushed to
+    # systemd-resolved over D-Bus) - a full restart of the networkd DAEMON
+    # itself is what reliably fixes it. Order matters: networkd first, so it
+    # has fresh DHCP data to publish, THEN resolved, so it actually picks
+    # that data up rather than restarting into an empty state again.
+    info "Restarting systemd-networkd (picks up DHCP-assigned DNS immediately, no reboot needed)"
+    systemctl restart systemd-networkd || warn "Could not restart systemd-networkd. DNS may not reappear until the next reboot - run 'sudo reboot' if 'resolvectl status' below still looks empty."
+    sleep 3
+
+    systemctl restart systemd-resolved
+
+    sleep 1
+    echo ""
+    echo "=== Result ==="
+    resolvectl status
+    return 0
+}
+
+# Preflight compatibility check. resolvectl EXISTING isn't enough proof this
+# module is safe to run - the binary ships as part of systemd itself, so it
+# can be present on a box where systemd-resolved isn't actually the active
+# resolver (common on plain Debian, which favours ifupdown/NetworkManager
+# and doesn't enable systemd-resolved by default the way Ubuntu does).
+# Running the DNS-writing logic against an inactive resolved would edit
+# files that nothing is actually reading, and REPORT success. This module
+# was also built and tested specifically against Ubuntu 24.04's stack
+# (netplan + systemd-networkd + systemd-resolved, including the
+# networkd-restart quirk in restore_default_dns) - flags anything else
+# rather than assuming it behaves the same way.
+# OS+version combos this module has actually been run against, end-to-end
+# (apply, switch, restore) and confirmed working. Add a "id:version" entry
+# here only after doing that - not just after reading the code and assuming
+# it should work. VERSION_ID from /etc/os-release, e.g. "24.04", "12", "13".
+_DNS_TESTED_OS_VERSIONS=(
+    "ubuntu:24.04"
+)
+
+_dns_check_prereqs() {
+    local os_id="" os_version=""
+    if [[ -f /etc/os-release ]]; then
+        os_id=$(. /etc/os-release 2>/dev/null; echo "$ID")
+        os_version=$(. /etc/os-release 2>/dev/null; echo "$VERSION_ID")
+    fi
+
+    if ! require_cmd resolvectl; then
+        warn "resolvectl not found - this module needs systemd-resolved. Aborting."
+        return 1
+    fi
+    if ! systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        warn "resolvectl is present, but systemd-resolved isn't the active resolver on this host"
+        warn "(systemctl is-active systemd-resolved reports it's not running). Writing DNS config"
+        warn "here would edit files nothing is actually reading. Aborting rather than report a"
+        warn "false success - if this host should be using systemd-resolved, enable it first:"
+        warn "  sudo systemctl enable --now systemd-resolved"
+        return 1
+    fi
+
+    local key="${os_id}:${os_version}" tested=false entry
+    for entry in "${_DNS_TESTED_OS_VERSIONS[@]}"; do
+        [[ "$entry" == "$key" ]] && { tested=true; break; }
+    done
+
+    if [[ "$tested" == false ]]; then
+        warn "This module has only been verified end-to-end on: ${_DNS_TESTED_OS_VERSIONS[*]}"
+        warn "Detected: ${os_id:-unknown} ${os_version:-unknown} - not on that list yet."
+        warn "Untested doesn't mean broken, just unconfirmed - the netplan step (silently"
+        warn "skipped if no netplan file exists) and the Restore option's networkd-restart"
+        warn "fix (which assumes networkd is what's actually managing DHCP) are the parts"
+        warn "most likely to behave differently on a distro/version this hasn't been run on."
+        read -rp "Continue anyway on this untested OS/version? [y/N]: " CONFIRM_OS_DNS
+        [[ "$CONFIRM_OS_DNS" =~ ^[Yy]$ ]] || { echo "Aborted - no changes made."; return 1; }
+    fi
+
+    return 0
+}
+
+setup_dot_dns() {
+    info "DNS-over-TLS (encrypted DNS, bypasses provider/datacenter DNS)"
+    _dns_check_prereqs || return 1
+
+    echo "Current resolver:"
+    resolvectl status | grep -E "Current DNS Server|DNSOverTLS" | sed 's/^/  /'
+    echo ""
+    echo "  1) Cloudflare  (1.1.1.1 / 1.0.0.1, fallback: Quad9)"
+    echo "  2) Quad9       (9.9.9.9 / 149.112.112.112, fallback: Cloudflare)"
+    echo "  3) Custom resolver"
+    echo "  4) Restore original (pre-toolkit) DNS config"
+    echo "  5) Back"
+    read -rp "Choose an option [1-5]: " DNS_CHOICE
+
+    local p_ip1="" p_ip2="" p_host="" f_ip1="" f_ip2="" f_host=""
+    case "$DNS_CHOICE" in
+        1)
+            p_ip1="$_DNS_CLOUDFLARE_IP1"; p_ip2="$_DNS_CLOUDFLARE_IP2"; p_host="$_DNS_CLOUDFLARE_HOST"
+            f_ip1="$_DNS_QUAD9_IP1"; f_ip2="$_DNS_QUAD9_IP2"; f_host="$_DNS_QUAD9_HOST"
+            ;;
+        2)
+            p_ip1="$_DNS_QUAD9_IP1"; p_ip2="$_DNS_QUAD9_IP2"; p_host="$_DNS_QUAD9_HOST"
+            f_ip1="$_DNS_CLOUDFLARE_IP1"; f_ip2="$_DNS_CLOUDFLARE_IP2"; f_host="$_DNS_CLOUDFLARE_HOST"
+            ;;
+        3)
+            echo ""
+            echo "DoT needs a hostname alongside each IP, for certificate validation."
+            read -rp "Primary DNS IP: " p_ip1
+            read -rp "Primary DNS hostname (for TLS cert validation): " p_host
+            read -rp "Second primary DNS IP (optional, blank to skip): " p_ip2
+            read -rp "Fallback DNS IP (optional, blank to skip): " f_ip1
+            if [[ -n "$f_ip1" ]]; then
+                read -rp "Fallback DNS hostname: " f_host
+                read -rp "Second fallback DNS IP (optional, blank to skip): " f_ip2
+            fi
+            [[ -n "$p_ip1" && -n "$p_host" ]] || { warn "Primary IP and hostname are required. Aborted."; return 1; }
+            ;;
+        4) restore_default_dns; return $? ;;
+        *) echo "Cancelled."; return 0 ;;
+    esac
+
+    local dns_line="${p_ip1}#${p_host}"
+    [[ -n "$p_ip2" ]] && dns_line="${dns_line} ${p_ip2}#${p_host}"
+    local fallback_line=""
+    if [[ -n "$f_ip1" ]]; then
+        fallback_line="${f_ip1}#${f_host}"
+        [[ -n "$f_ip2" ]] && fallback_line="${fallback_line} ${f_ip2}#${f_host}"
+    fi
+
+    echo ""
+    echo "This will set:"
+    echo "  Primary:  ${dns_line}"
+    [[ -n "$fallback_line" ]] && echo "  Fallback: ${fallback_line}"
+    echo "  DNS-over-TLS: enforced (DNSOverTLS=yes)"
+    echo "  DHCP-supplied DNS: disabled on the primary interface (netplan dhcp4-overrides)"
+    read -rp "Apply this now? [y/N]: " CONFIRM_DNS
+    [[ "$CONFIRM_DNS" =~ ^[Yy]$ ]] || { echo "Cancelled."; return 0; }
+
+    info "Updating /etc/systemd/resolved.conf"
+    _dns_write_resolved_conf "$dns_line" "$fallback_line" || return 1
+
+    local iface=""
+    local nfile
+    if nfile=$(_dns_netplan_file); then
+        info "Updating netplan ($nfile)"
+        iface=$(_dns_write_netplan "$nfile" "$p_ip1" "${p_ip2:-$p_ip1}")
+        if [[ -n "$iface" ]]; then
+            echo "Applying netplan..."
+            netplan apply || warn "netplan apply reported an issue - check the output above."
+        fi
+    fi
+
+    info "Restarting systemd-resolved"
+    systemctl restart systemd-resolved
+
+    # Clears any DHCP-supplied per-link resolver still cached from before
+    # this run, so the change takes effect immediately rather than waiting
+    # for the next DHCP lease renewal or reboot.
+    if [[ -n "$iface" ]]; then
+        resolvectl dns "$iface" "" 2>/dev/null || true
+    fi
+
+    sleep 1
+    echo ""
+    echo "=== Result ==="
+    resolvectl status
+    echo ""
+    echo "Test query:"
+    resolvectl query example.com || warn "Test query failed - check the output above."
+    echo ""
+    echo "Look for '+DNSOverTLS' above, and 'Data was acquired via local or encrypted"
+    echo "transport: yes' in the query result - that confirms it's actually encrypted,"
+    echo "not just configured."
+    return 0
+}
+
+# ============================================================
 # ---------- module: scheduled reboot + time sync ----------
 # Sets an optional timezone, adds/updates a daily reboot cron job for root,
 # and ensures the clock stays accurate via systemd-timesyncd/NTP (so the
@@ -1258,9 +1612,24 @@ setup_scheduled_reboot() {
     return 0
 }
 
+
 # ============================================================
 # ---------- entry checks ----------
 # ============================================================
+
+# Purely informational, computed once - shown in the menu header every loop
+# so it's obvious what OS/version any given run (or screenshot) was against.
+# No gating here; only the DNS-over-TLS module actually checks this against
+# a tested-version list, since it's the only module with genuinely
+# OS-specific mechanics (netplan, systemd-networkd). Everything else in this
+# toolkit is built on portable apt/systemd primitives.
+_TOOLKIT_OS_LABEL="unknown OS"
+if [[ -f /etc/os-release ]]; then
+    _detected_id=$(. /etc/os-release 2>/dev/null; echo "$ID")
+    _detected_version=$(. /etc/os-release 2>/dev/null; echo "$VERSION_ID")
+    [[ -n "$_detected_id" ]] && _TOOLKIT_OS_LABEL="${_detected_id}${_detected_version:+ $_detected_version}"
+fi
+
 
 if [[ $EUID -ne 0 ]]; then
     error "This script needs root privileges. Re-run with: sudo $0"
@@ -1279,21 +1648,23 @@ done
 while true; do
     echo ""
     info "aio-toolkit — utility menu"
+    echo "Detected OS: ${_TOOLKIT_OS_LABEL}"
     echo ""
     echo "  1) System maintenance (update, upgrade, cleanup, journal trim, history)"
     echo "  2) Check / set up swap space (auto-sized to your RAM, skips if already present)"
     echo "  3) Harden server (fail2ban + UFW firewall + automatic security updates)"
     echo "  4) Enable BBR congestion control (smoother throughput on fast links)"
-    echo "  5) Set up scheduled daily reboot + clock sync (NTP)"
-    echo "  6) Check root SSH login status (across every sshd config file, not just one)"
-    echo "  7) Create a non-root sudo user (adds them, sudo group, copies root's SSH key)"
-    echo "  8) Enable root SSH login (copies your key, sets PermitRootLogin, restarts sshd)"
-    echo "  9) Passwordless sudo for a user (real security trade-off — reads warnings)"
-    echo " 10) Disable root SSH login (locks it down — reads warnings before proceeding)"
-    echo " 11) Remove a user (permanent — reads warnings, requires typed confirmation)"
-    echo " 12) Exit"
+    echo "  5) DNS-over-TLS (Cloudflare / Quad9 / custom — bypasses provider DNS)"
+    echo "  6) Set up scheduled daily reboot + clock sync (NTP)"
+    echo "  7) Check root SSH login status (across every sshd config file, not just one)"
+    echo "  8) Create a non-root sudo user (adds them, sudo group, copies root's SSH key)"
+    echo "  9) Enable root SSH login (copies your key, sets PermitRootLogin, restarts sshd)"
+    echo " 10) Passwordless sudo for a user (real security trade-off — reads warnings)"
+    echo " 11) Disable root SSH login (locks it down — reads warnings before proceeding)"
+    echo " 12) Remove a user (permanent — reads warnings, requires typed confirmation)"
+    echo " 13) Exit"
     echo ""
-    read -rp "Select an option [1-12]: " MENU_CHOICE
+    read -rp "Select an option [1-13]: " MENU_CHOICE
 
     case "$MENU_CHOICE" in
         1)
@@ -1317,34 +1688,38 @@ while true; do
             press_enter
             ;;
         5)
-            setup_scheduled_reboot || warn "Scheduled reboot setup did not fully complete — see messages above."
+            setup_dot_dns || warn "DNS setup did not fully complete — see messages above. Safe to re-run any time."
             press_enter
             ;;
         6)
-            check_root_login_status
+            setup_scheduled_reboot || warn "Scheduled reboot setup did not fully complete — see messages above."
             press_enter
             ;;
         7)
-            create_sudo_user || warn "User creation did not fully complete — see messages above."
+            check_root_login_status
             press_enter
             ;;
         8)
-            enable_root_ssh || warn "Root SSH setup did not fully complete — see messages above."
+            create_sudo_user || warn "User creation did not fully complete — see messages above."
             press_enter
             ;;
         9)
-            setup_passwordless_sudo || warn "Passwordless sudo setup did not fully complete — see messages above."
+            enable_root_ssh || warn "Root SSH setup did not fully complete — see messages above."
             press_enter
             ;;
         10)
-            disable_root_login || warn "Disabling root SSH login did not fully complete — see messages above."
+            setup_passwordless_sudo || warn "Passwordless sudo setup did not fully complete — see messages above."
             press_enter
             ;;
         11)
-            remove_user || warn "User removal did not fully complete — see messages above."
+            disable_root_login || warn "Disabling root SSH login did not fully complete — see messages above."
             press_enter
             ;;
         12)
+            remove_user || warn "User removal did not fully complete — see messages above."
+            press_enter
+            ;;
+        13)
             echo "Exiting."
             exit 0
             ;;
