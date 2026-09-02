@@ -1366,7 +1366,7 @@ restore_default_dns() {
     sleep 1
     echo ""
     echo "=== Result ==="
-    resolvectl status
+    resolvectl status --no-pager
     return 0
 }
 
@@ -1513,7 +1513,7 @@ setup_dot_dns() {
     sleep 1
     echo ""
     echo "=== Result ==="
-    resolvectl status
+    resolvectl status --no-pager
     echo ""
     echo "Test query:"
     resolvectl query example.com || warn "Test query failed - check the output above."
