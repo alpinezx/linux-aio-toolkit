@@ -162,151 +162,92 @@ EOF
     return 0
 }
 
-# Installs fail2ban (SSH brute-force protection), UFW (firewall), and
-# unattended-upgrades (automatic security updates) — each one independently
-# optional. Idempotent: skips anything already installed and active.
+# Installs fail2ban (SSH brute-force protection) and UFW (firewall).
+# Idempotent: skips anything already installed and active.
 # Deliberately does NOT touch SSH password settings — that's a manual,
 # check-every-step process best done by hand, not automated here.
 #
-# Each piece is asked about interactively. Skip a prompt by exporting one or
-# more of INSTALL_FAIL2BAN / INSTALL_UFW / INSTALL_AUTO_UPDATES as y or n
-# before calling (e.g. INSTALL_UFW=n ./aio-toolkit.sh). UFW_PORTS controls
-# which ports get allowed if UFW is installed. Defaults to SSH/HTTP/HTTPS
+# UFW_PORTS controls which ports get allowed. Defaults to SSH/HTTP/HTTPS
 # (22, 80, 443) — override by exporting UFW_PORTS="22 80 443 8080" etc.
+# before calling, or extend this once per-tool port needs are known.
 harden_server() {
     local ports=(${UFW_PORTS:-22 80 443})
-    local do_fail2ban="${INSTALL_FAIL2BAN:-}"
-    local do_ufw="${INSTALL_UFW:-}"
-    local do_auto_updates="${INSTALL_AUTO_UPDATES:-}"
 
-    info "Server hardening (pick what you want — everything below is optional)"
-
-    if [[ -z "$do_fail2ban" ]]; then
-        read -rp "Install/enable fail2ban (bans repeated SSH login failures)? [Y/n]: " CHOICE
-        [[ "$CHOICE" =~ ^[Nn]$ ]] && do_fail2ban="n" || do_fail2ban="y"
-    fi
-    if [[ -z "$do_ufw" ]]; then
-        read -rp "Install/enable UFW (firewall)? [Y/n]: " CHOICE
-        [[ "$CHOICE" =~ ^[Nn]$ ]] && do_ufw="n" || do_ufw="y"
-    fi
-    if [[ -z "$do_auto_updates" ]]; then
-        read -rp "Enable unattended-upgrades (automatic security-only OS updates)? [Y/n]: " CHOICE
-        [[ "$CHOICE" =~ ^[Nn]$ ]] && do_auto_updates="n" || do_auto_updates="y"
-    fi
-
-    if [[ "$do_fail2ban" == "n" && "$do_ufw" == "n" && "$do_auto_updates" == "n" ]]; then
-        warn "Nothing selected — hardening skipped."
-        return 0
-    fi
+    info "Server hardening: fail2ban + UFW + automatic security updates"
 
     apt-get update -qq || { warn "apt update failed — check your network and try again."; return 1; }
 
-    local f2b_summary="fail2ban skipped (not requested)"
-    local ufw_summary="UFW skipped (not requested)"
-    local updates_summary="automatic security updates skipped (not requested)"
+    # --- fail2ban ---
+    if systemctl is-active --quiet fail2ban 2>/dev/null; then
+        echo "fail2ban is already installed and running, skipping install."
+    else
+        echo "Installing fail2ban (bans IPs that repeatedly fail SSH login)..."
+        apt-get install -y -qq fail2ban || { warn "fail2ban install failed."; return 1; }
+        systemctl enable --now fail2ban
+        echo "fail2ban is active. Check it any time with: fail2ban-client status sshd"
+        echo "(A high 'Total failed' count is normal — that's internet bot noise, not you being targeted.)"
+    fi
 
-    # --- fail2ban (optional) ---
-    if [[ "$do_fail2ban" == "y" ]]; then
-        if systemctl is-active --quiet fail2ban 2>/dev/null; then
-            echo "fail2ban is already installed and running, skipping install."
-        else
-            echo "Installing fail2ban (bans IPs that repeatedly fail SSH login)..."
-            apt-get install -y -qq fail2ban || { warn "fail2ban install failed."; return 1; }
-            systemctl enable --now fail2ban
-            echo "fail2ban is active. Check it any time with: fail2ban-client status sshd"
-            echo "(A high 'Total failed' count is normal — that's internet bot noise, not you being targeted.)"
-        fi
-
-        # Known fail2ban packaging bug: the default filter.d/sshd.conf hardcodes
-        # "journalmatch = _SYSTEMD_UNIT=sshd.service", but on Debian/Ubuntu the
-        # actual systemd unit is usually "ssh.service", not "sshd.service". Left
-        # as-is, fail2ban runs, reports "active", and looks fine in status output
-        # — but silently matches zero journal entries and never bans anyone.
-        # This runs every time (idempotent, no downside either way) so both
-        # fresh installs and pre-existing ones get corrected.
-        local ssh_unit="ssh.service"
-        if systemctl list-unit-files 2>/dev/null | grep -q "^sshd\.service"; then
-            ssh_unit="sshd.service"
-        fi
-        cat > /etc/fail2ban/jail.d/sshd.local <<EOF
+    # Known fail2ban packaging bug: the default filter.d/sshd.conf hardcodes
+    # "journalmatch = _SYSTEMD_UNIT=sshd.service", but on Debian/Ubuntu the
+    # actual systemd unit is usually "ssh.service", not "sshd.service". Left
+    # as-is, fail2ban runs, reports "active", and looks fine in status output
+    # — but silently matches zero journal entries and never bans anyone.
+    # This runs every time (idempotent, no downside either way) so both
+    # fresh installs and pre-existing ones get corrected.
+    local ssh_unit="ssh.service"
+    if systemctl list-unit-files 2>/dev/null | grep -q "^sshd\.service"; then
+        ssh_unit="sshd.service"
+    fi
+    cat > /etc/fail2ban/jail.d/sshd.local <<EOF
 [sshd]
 enabled = true
 backend = systemd
 journalmatch = _SYSTEMD_UNIT=${ssh_unit}
 EOF
-        systemctl restart fail2ban
-        echo "fail2ban's SSH journal filter verified/corrected (watching ${ssh_unit})."
-        f2b_summary="fail2ban"
+    systemctl restart fail2ban
+    echo "fail2ban's SSH journal filter verified/corrected (watching ${ssh_unit})."
+
+    # --- UFW ---
+    if require_cmd ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
+        echo "UFW is already active, ensuring base ports are allowed..."
     else
-        echo "Skipping fail2ban per your choice."
-        if systemctl is-active --quiet fail2ban 2>/dev/null; then
-            warn "Note: fail2ban is already installed and running from a previous run — leaving it as-is."
-            f2b_summary="fail2ban (pre-existing, left as-is)"
-        fi
+        echo "Installing UFW (firewall)..."
+        apt-get install -y -qq ufw || { warn "UFW install failed."; return 1; }
     fi
 
-    # --- UFW (optional) ---
-    if [[ "$do_ufw" == "y" ]]; then
-        if require_cmd ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
-            echo "UFW is already active, ensuring base ports are allowed..."
-        else
-            echo "Installing UFW (firewall)..."
-            apt-get install -y -qq ufw || { warn "UFW install failed."; return 1; }
-        fi
+    local p
+    for p in "${ports[@]}"; do
+        ufw allow "$p" >/dev/null 2>&1 || warn "Could not add UFW rule for port $p."
+    done
 
-        local p
-        for p in "${ports[@]}"; do
-            ufw allow "$p" >/dev/null 2>&1 || warn "Could not add UFW rule for port $p."
-        done
-
-        if ! ufw status 2>/dev/null | grep -q "Status: active"; then
-            # --force skips the interactive "this may disconnect SSH" prompt —
-            # safe here specifically because SSH's port (22) is guaranteed to be
-            # in $ports by the default above; if the caller overrode UFW_PORTS
-            # and dropped 22, warn loudly before enabling.
-            if [[ ! " ${ports[*]} " =~ " 22 " ]]; then
-                alert "UFW is about to be enabled but port 22 (SSH) is NOT in the allow list."
-                alert "This can lock you out of the server over SSH."
-                read -rp "Continue enabling UFW anyway? [y/N]: " CONFIRM_UFW_NO_SSH
-                if [[ ! "$CONFIRM_UFW_NO_SSH" =~ ^[Yy]$ ]]; then
-                    warn "UFW left disabled. Add port 22 to UFW_PORTS and re-run."
-                    do_ufw="n"
-                    ufw_summary="UFW left disabled (no port 22 in allow list)"
-                fi
+    if ! ufw status 2>/dev/null | grep -q "Status: active"; then
+        # --force skips the interactive "this may disconnect SSH" prompt —
+        # safe here specifically because SSH's port (22) is guaranteed to be
+        # in $ports by the default above; if the caller overrode UFW_PORTS
+        # and dropped 22, warn loudly before enabling.
+        if [[ ! " ${ports[*]} " =~ " 22 " ]]; then
+            alert "UFW is about to be enabled but port 22 (SSH) is NOT in the allow list."
+            alert "This can lock you out of the server over SSH."
+            read -rp "Continue enabling UFW anyway? [y/N]: " CONFIRM_UFW_NO_SSH
+            if [[ ! "$CONFIRM_UFW_NO_SSH" =~ ^[Yy]$ ]]; then
+                warn "UFW left disabled. Add port 22 to UFW_PORTS and re-run."
+                setup_auto_updates || warn "Automatic security updates step did not fully complete."
+                return 1
             fi
-            if [[ "$do_ufw" == "y" ]]; then
-                ufw --force enable
-                echo "UFW enabled. Allowed ports: ${ports[*]}"
-                ufw status verbose
-                ufw_summary="UFW (${ports[*]})"
-            fi
-        else
-            echo "UFW already active. Allowed ports (added/confirmed): ${ports[*]}"
-            ufw status verbose
-            ufw_summary="UFW (${ports[*]})"
         fi
+        ufw --force enable
+        echo "UFW enabled. Allowed ports: ${ports[*]}"
     else
-        echo "Skipping UFW per your choice."
-        if require_cmd ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
-            warn "Note: UFW is already installed and active from a previous run — leaving it as-is."
-            ufw_summary="UFW (pre-existing, left as-is)"
-        fi
+        echo "UFW already active. Allowed ports (added/confirmed): ${ports[*]}"
     fi
 
-    # --- automatic security updates (optional) ---
-    if [[ "$do_auto_updates" == "y" ]]; then
-        setup_auto_updates || warn "Automatic security updates step did not fully complete."
-        updates_summary="automatic security updates"
-    else
-        echo "Skipping automatic security updates per your choice."
-        if dpkg -s unattended-upgrades >/dev/null 2>&1; then
-            warn "Note: unattended-upgrades is already installed from a previous run — leaving it as-is."
-            updates_summary="automatic security updates (pre-existing, left as-is)"
-        fi
-    fi
+    ufw status verbose
+
+    setup_auto_updates || warn "Automatic security updates step did not fully complete."
 
     echo ""
-    echo "Hardening complete: ${f2b_summary}, ${ufw_summary}, ${updates_summary}."
+    echo "Hardening complete: fail2ban, UFW (${ports[*]}), automatic security updates."
     return 0
 }
 
@@ -1596,7 +1537,7 @@ setup_dot_dns() {
 setup_scheduled_reboot() {
     local cron_marker="# aio-toolkit: scheduled-reboot"
 
-    info "Scheduled daily reboot + clock sync"
+    info "Scheduled reboot + clock sync"
 
     local existing_line
     existing_line=$(crontab -l 2>/dev/null | grep -F "$cron_marker" || true)
@@ -1608,9 +1549,39 @@ setup_scheduled_reboot() {
     fi
     echo ""
 
+    # --- frequency (asked first so "disable" can bail out before any other
+    # prompts — no point asking about timezone/time if you're just turning
+    # the whole thing off) ---
+    local freq_choice frequency
+    echo "How often should the reboot run?"
+    echo "  1) Daily"
+    echo "  2) Weekly"
+    echo "  3) Monthly"
+    echo "  4) Disable / remove the current scheduled reboot"
+    read -rp "Select [1-4] (default 1): " freq_choice
+    freq_choice="${freq_choice:-1}"
+    case "$freq_choice" in
+        1) frequency="daily" ;;
+        2) frequency="weekly" ;;
+        3) frequency="monthly" ;;
+        4) frequency="disable" ;;
+        *) warn "'$freq_choice' isn't a valid choice. Aborting — no changes made to the cron job."; return 1 ;;
+    esac
+
+    if [[ "$frequency" == "disable" ]]; then
+        if [[ -z "$existing_line" ]]; then
+            echo "Nothing to disable, there's no scheduled reboot set up right now."
+            return 0
+        fi
+        (crontab -l 2>/dev/null | grep -vF "$cron_marker" || true) | crontab -
+        echo "Scheduled reboot removed. (Clock sync via systemd-timesyncd, if it was enabled, is left as-is.)"
+        return 0
+    fi
+
     # --- timezone (optional) ---
     local current_tz
     current_tz=$(timedatectl show -p Timezone --value 2>/dev/null || echo "unknown")
+    echo ""
     read -rp "Current timezone is '$current_tz'. Enter an IANA timezone to change it (e.g. Europe/London), or leave blank to keep it: " NEW_TZ
     if [[ -n "$NEW_TZ" ]]; then
         if timedatectl set-timezone "$NEW_TZ" 2>/dev/null; then
@@ -1620,9 +1591,43 @@ setup_scheduled_reboot() {
         fi
     fi
 
+    # --- day (only for weekly/monthly) ---
+    local dom="*" dow="*"
+    if [[ "$frequency" == "weekly" ]]; then
+        local day_input day_lc
+        echo ""
+        echo "Day of the week to reboot. Enter a name (Sun, Mon, Tue, Wed, Thu, Fri, Sat)"
+        echo "or a number (0/7=Sun, 1=Mon, 2=Tue, 3=Wed, 4=Thu, 5=Fri, 6=Sat)."
+        read -rp "Day (default Sun): " day_input
+        day_input="${day_input:-Sun}"
+        day_lc=$(echo "$day_input" | tr '[:upper:]' '[:lower:]')
+        case "$day_lc" in
+            sun|sunday|0|7) dow=0 ;;
+            mon|monday|1)   dow=1 ;;
+            tue|tues|tuesday|2) dow=2 ;;
+            wed|weds|wednesday|3) dow=3 ;;
+            thu|thur|thurs|thursday|4) dow=4 ;;
+            fri|friday|5)   dow=5 ;;
+            sat|saturday|6) dow=6 ;;
+            *)
+                warn "'$day_input' isn't a day I recognize. Aborting — no changes made to the cron job."
+                return 1
+                ;;
+        esac
+    elif [[ "$frequency" == "monthly" ]]; then
+        local day_num
+        read -rp "Day of the month to reboot, 1-28 (default 1; capped at 28 so it fires every month): " day_num
+        day_num="${day_num:-1}"
+        if [[ ! "$day_num" =~ ^([1-9]|1[0-9]|2[0-8])$ ]]; then
+            warn "'$day_num' isn't valid — enter a number from 1 to 28. Aborting — no changes made to the cron job."
+            return 1
+        fi
+        dom="$day_num"
+    fi
+
     # --- reboot time ---
     local reboot_time hour minute
-    read -rp "Daily reboot time, 24h HH:MM (default 06:30, matching your current timezone): " reboot_time
+    read -rp "Reboot time, 24h HH:MM (default 06:30, matching your current timezone): " reboot_time
     reboot_time="${reboot_time:-06:30}"
     if [[ ! "$reboot_time" =~ ^([01][0-9]|2[0-3]):([0-5][0-9])$ ]]; then
         warn "'$reboot_time' isn't a valid HH:MM time. Aborting — no changes made to the cron job."
@@ -1634,7 +1639,7 @@ setup_scheduled_reboot() {
     hour=$((10#$hour))
     minute=$((10#$minute))
 
-    local new_line="${minute} ${hour} * * * /sbin/shutdown -r now  ${cron_marker}"
+    local new_line="${minute} ${hour} ${dom} * ${dow} /sbin/shutdown -r now  ${cron_marker}"
     # Idempotent update: drop any prior line carrying our marker, then add
     # the new one — re-running this always leaves exactly one such entry.
     # NOTE: 'crontab -l' exits non-zero (with an empty/no-op stream) if root
@@ -1644,7 +1649,15 @@ setup_scheduled_reboot() {
     # 'echo "$new_line"' ever ran. The '|| true' makes an empty/missing
     # crontab a non-event, same as the read-only check above.
     (crontab -l 2>/dev/null | grep -vF "$cron_marker" || true; echo "$new_line") | crontab -
-    echo "Scheduled: reboot daily at ${reboot_time} ($(timedatectl show -p Timezone --value 2>/dev/null))."
+
+    local schedule_desc="daily"
+    if [[ "$frequency" == "weekly" ]]; then
+        local -a day_names=(Sunday Monday Tuesday Wednesday Thursday Friday Saturday Sunday)
+        schedule_desc="weekly on ${day_names[$dow]}"
+    elif [[ "$frequency" == "monthly" ]]; then
+        schedule_desc="monthly on day ${dom}"
+    fi
+    echo "Scheduled: reboot ${schedule_desc} at ${reboot_time} ($(timedatectl show -p Timezone --value 2>/dev/null))."
 
     # --- NTP / clock sync ---
     echo ""
@@ -1663,7 +1676,7 @@ setup_scheduled_reboot() {
     timedatectl | grep -E "synchronized|NTP service|Time zone" || timedatectl
 
     echo ""
-    echo "Note: this reboot is unconditional (happens daily regardless of need) and is"
+    echo "Note: this reboot is unconditional (happens on schedule regardless of need) and is"
     echo "separate from unattended-upgrades' own occasional reboot-on-patch behavior."
     echo "If you've also enabled automatic security updates (hardening module), it's"
     echo "worth checking Automatic-Reboot-Time in /etc/apt/apt.conf.d/50unattended-upgrades"
@@ -1671,6 +1684,44 @@ setup_scheduled_reboot() {
     return 0
 }
 
+
+# Read-only: shows whatever scheduled-reboot cron line aio-toolkit currently
+# owns (if any) and translates it into plain English, without touching
+# timezone, frequency, or NTP. Separate from setup_scheduled_reboot so you
+# can check status without wading through the setup prompts.
+check_scheduled_reboot_status() {
+    local cron_marker="# aio-toolkit: scheduled-reboot"
+    local existing_line
+
+    info "Scheduled reboot status"
+
+    existing_line=$(crontab -l 2>/dev/null | grep -F "$cron_marker" || true)
+    if [[ -z "$existing_line" ]]; then
+        echo "No scheduled reboot is currently set up."
+        return 0
+    fi
+
+    local minute hour dom dow rest
+    read -r minute hour dom _ dow rest <<< "$existing_line"
+
+    local -a day_names=(Sunday Monday Tuesday Wednesday Thursday Friday Saturday Sunday)
+    local schedule_desc time_str
+    time_str=$(printf '%02d:%02d' "$hour" "$minute")
+
+    if [[ "$dom" != "*" ]]; then
+        schedule_desc="monthly on day ${dom}"
+    elif [[ "$dow" != "*" ]]; then
+        schedule_desc="weekly on ${day_names[$dow]}"
+    else
+        schedule_desc="daily"
+    fi
+
+    echo "Reboot scheduled: ${schedule_desc} at ${time_str}"
+    echo "  (system timezone: $(timedatectl show -p Timezone --value 2>/dev/null || echo "unknown"))"
+    echo ""
+    echo "Raw cron line: $existing_line"
+    return 0
+}
 
 # ============================================================
 # ---------- entry checks ----------
@@ -1711,19 +1762,20 @@ while true; do
     echo ""
     echo "  1) System maintenance (update, upgrade, cleanup, journal trim, history)"
     echo "  2) Check / set up swap space (auto-sized to your RAM, skips if already present)"
-    echo "  3) Harden server (fail2ban / UFW firewall / automatic security updates, pick any)"
+    echo "  3) Harden server (fail2ban + UFW firewall + automatic security updates)"
     echo "  4) Enable BBR congestion control (smoother throughput on fast links)"
     echo "  5) DNS-over-TLS (Cloudflare / Quad9 / custom — bypasses provider DNS)"
-    echo "  6) Set up scheduled daily reboot + clock sync (NTP)"
-    echo "  7) Check root SSH login status (across every sshd config file, not just one)"
-    echo "  8) Create a non-root sudo user (adds them, sudo group, copies root's SSH key)"
-    echo "  9) Enable root SSH login (copies your key, sets PermitRootLogin, restarts sshd)"
-    echo " 10) Passwordless sudo for a user (real security trade-off — reads warnings)"
-    echo " 11) Disable root SSH login (locks it down — reads warnings before proceeding)"
-    echo " 12) Remove a user (permanent — reads warnings, requires typed confirmation)"
-    echo " 13) Exit"
+    echo "  6) Set up scheduled reboot (daily/weekly/monthly) + clock sync (NTP)"
+    echo "  7) Check current scheduled reboot status (read-only, no prompts)"
+    echo "  8) Check root SSH login status (across every sshd config file, not just one)"
+    echo "  9) Create a non-root sudo user (adds them, sudo group, copies root's SSH key)"
+    echo " 10) Enable root SSH login (copies your key, sets PermitRootLogin, restarts sshd)"
+    echo " 11) Passwordless sudo for a user (real security trade-off — reads warnings)"
+    echo " 12) Disable root SSH login (locks it down — reads warnings before proceeding)"
+    echo " 13) Remove a user (permanent — reads warnings, requires typed confirmation)"
+    echo " 14) Exit"
     echo ""
-    read -rp "Select an option [1-13]: " MENU_CHOICE
+    read -rp "Select an option [1-14]: " MENU_CHOICE
 
     case "$MENU_CHOICE" in
         1)
@@ -1755,30 +1807,34 @@ while true; do
             press_enter
             ;;
         7)
-            check_root_login_status
+            check_scheduled_reboot_status
             press_enter
             ;;
         8)
-            create_sudo_user || warn "User creation did not fully complete — see messages above."
+            check_root_login_status
             press_enter
             ;;
         9)
-            enable_root_ssh || warn "Root SSH setup did not fully complete — see messages above."
+            create_sudo_user || warn "User creation did not fully complete — see messages above."
             press_enter
             ;;
         10)
-            setup_passwordless_sudo || warn "Passwordless sudo setup did not fully complete — see messages above."
+            enable_root_ssh || warn "Root SSH setup did not fully complete — see messages above."
             press_enter
             ;;
         11)
-            disable_root_login || warn "Disabling root SSH login did not fully complete — see messages above."
+            setup_passwordless_sudo || warn "Passwordless sudo setup did not fully complete — see messages above."
             press_enter
             ;;
         12)
-            remove_user || warn "User removal did not fully complete — see messages above."
+            disable_root_login || warn "Disabling root SSH login did not fully complete — see messages above."
             press_enter
             ;;
         13)
+            remove_user || warn "User removal did not fully complete — see messages above."
+            press_enter
+            ;;
+        14)
             echo "Exiting."
             exit 0
             ;;
