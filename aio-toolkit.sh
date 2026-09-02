@@ -1170,6 +1170,93 @@ enable_bbr() {
     return 0
 }
 
+# Reverts TCP congestion control from BBR back to CUBIC, live and persisted.
+# Mirrors enable_bbr(): checks current state first, is idempotent, and
+# undoes exactly what enable_bbr() wrote (sysctl.conf line + the
+# modules-load.d entry) rather than blindly overwriting unrelated settings.
+# Leaves the fq qdisc in place deliberately — fq works fine under CUBIC too
+# and there's no CUBIC-specific qdisc to restore instead.
+revert_to_cubic() {
+    local current persisted_bbr
+
+    info "TCP congestion control: revert to CUBIC"
+    current=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
+    echo "Current: $current"
+
+    persisted_bbr=false
+    if grep -q '^net.ipv4.tcp_congestion_control=bbr' /etc/sysctl.conf 2>/dev/null; then
+        persisted_bbr=true
+    fi
+
+    if [[ "$current" == "cubic" && "$persisted_bbr" == false ]]; then
+        echo "Already on CUBIC and nothing BBR-related is persisted — nothing to do."
+        return 0
+    fi
+
+    read -rp "Switch TCP congestion control back to CUBIC now (live)? [Y/n]: " CONFIRM_CUBIC
+    CONFIRM_CUBIC="${CONFIRM_CUBIC:-Y}"
+    if [[ ! "$CONFIRM_CUBIC" =~ ^[Yy]$ ]]; then
+        warn "Aborted. No changes made."
+        return 0
+    fi
+
+    if ! sysctl -w net.ipv4.tcp_congestion_control=cubic >/dev/null 2>&1; then
+        warn "Could not switch to CUBIC live. Is it in tcp_available_congestion_control?"
+        return 1
+    fi
+    current=$(sysctl -n net.ipv4.tcp_congestion_control)
+    echo "Active now: $current"
+
+    if [[ "$persisted_bbr" == false && ! -f /etc/modules-load.d/bbr.conf ]]; then
+        echo "No persisted BBR config found — live switch is enough, nothing to undo on disk."
+        return 0
+    fi
+
+    read -rp "Also remove the persisted BBR config so it stays CUBIC after reboot? [Y/n]: " CONFIRM_PERSIST_CUBIC
+    CONFIRM_PERSIST_CUBIC="${CONFIRM_PERSIST_CUBIC:-Y}"
+    if [[ ! "$CONFIRM_PERSIST_CUBIC" =~ ^[Yy]$ ]]; then
+        warn "Not persisted. It will revert back to BBR on reboot (BBR is still configured on disk)."
+        return 0
+    fi
+
+    if grep -q '^net.ipv4.tcp_congestion_control=' /etc/sysctl.conf 2>/dev/null; then
+        sed -i 's/^net.ipv4.tcp_congestion_control=.*/net.ipv4.tcp_congestion_control=cubic/' /etc/sysctl.conf
+    fi
+
+    # Only the module autoload entry gets removed here — see the function
+    # comment above for why fq itself is left alone.
+    if [[ -f /etc/modules-load.d/bbr.conf ]]; then
+        rm -f /etc/modules-load.d/bbr.conf
+    fi
+
+    sysctl -p >/dev/null 2>&1 || warn "sysctl -p reported an issue applying /etc/sysctl.conf — check it for unrelated bad lines. CUBIC setting was still written to the file."
+    echo "Persisted. CUBIC will survive reboots — confirmed via:"
+    sysctl net.ipv4.tcp_congestion_control
+    return 0
+}
+
+# Small submenu wrapper for the main menu's congestion-control option, so
+# BBR and its revert-to-CUBIC counterpart share one numbered slot instead
+# of pushing every later option up by one.
+congestion_control_menu() {
+    local current
+    current=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
+
+    echo ""
+    info "TCP congestion control (currently: ${current})"
+    echo "  1) Enable BBR"
+    echo "  2) Revert to CUBIC"
+    echo "  3) Back to main menu"
+    read -rp "Select an option [1-3]: " CC_CHOICE
+
+    case "$CC_CHOICE" in
+        1) enable_bbr || warn "BBR setup did not fully complete — see messages above." ;;
+        2) revert_to_cubic || warn "Revert to CUBIC did not fully complete — see messages above." ;;
+        3) return 0 ;;
+        *) warn "Not a valid option." ;;
+    esac
+}
+
 # ============================================================
 # ---------- module: DNS-over-TLS (encrypted DNS) ----------
 # Switches the host's DNS resolution to DNS-over-TLS, so provider- or
@@ -1763,7 +1850,7 @@ while true; do
     echo "  1) System maintenance (update, upgrade, cleanup, journal trim, history)"
     echo "  2) Check / set up swap space (auto-sized to your RAM, skips if already present)"
     echo "  3) Harden server (fail2ban + UFW firewall + automatic security updates)"
-    echo "  4) Enable BBR congestion control (smoother throughput on fast links)"
+    echo "  4) TCP congestion control (enable BBR / revert to CUBIC)"
     echo "  5) DNS-over-TLS (Cloudflare / Quad9 / custom — bypasses provider DNS)"
     echo "  6) Set up scheduled reboot (daily/weekly/monthly) + clock sync (NTP)"
     echo "  7) Check current scheduled reboot status (read-only, no prompts)"
@@ -1795,7 +1882,7 @@ while true; do
             press_enter
             ;;
         4)
-            enable_bbr || warn "BBR setup did not fully complete — see messages above."
+            congestion_control_menu
             press_enter
             ;;
         5)
