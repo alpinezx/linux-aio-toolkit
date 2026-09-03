@@ -162,92 +162,123 @@ EOF
     return 0
 }
 
-# Installs fail2ban (SSH brute-force protection) and UFW (firewall).
-# Idempotent: skips anything already installed and active.
+# Installs fail2ban (SSH brute-force protection), UFW (firewall), and
+# unattended-upgrades (automatic security updates) — each one optional,
+# asked about independently, so you can pick any combination. Idempotent:
+# skips anything already installed and active.
 # Deliberately does NOT touch SSH password settings — that's a manual,
 # check-every-step process best done by hand, not automated here.
 #
-# UFW_PORTS controls which ports get allowed. Defaults to SSH/HTTP/HTTPS
-# (22, 80, 443) — override by exporting UFW_PORTS="22 80 443 8080" etc.
-# before calling, or extend this once per-tool port needs are known.
+# UFW_PORTS controls which ports get allowed if UFW is installed. Defaults
+# to SSH/HTTP/HTTPS (22, 80, 443) — override by exporting
+# UFW_PORTS="22 80 443 8080" etc. before calling, or extend this once
+# per-tool port needs are known.
 harden_server() {
     local ports=(${UFW_PORTS:-22 80 443})
 
     info "Server hardening: fail2ban + UFW + automatic security updates"
+    echo "Each piece below is independent — answer per component, skip anything you don't want."
 
     apt-get update -qq || { warn "apt update failed — check your network and try again."; return 1; }
 
-    # --- fail2ban ---
-    if systemctl is-active --quiet fail2ban 2>/dev/null; then
-        echo "fail2ban is already installed and running, skipping install."
-    else
-        echo "Installing fail2ban (bans IPs that repeatedly fail SSH login)..."
-        apt-get install -y -qq fail2ban || { warn "fail2ban install failed."; return 1; }
-        systemctl enable --now fail2ban
-        echo "fail2ban is active. Check it any time with: fail2ban-client status sshd"
-        echo "(A high 'Total failed' count is normal — that's internet bot noise, not you being targeted.)"
-    fi
+    local did_fail2ban="skipped" did_ufw="skipped" did_updates="skipped"
 
-    # Known fail2ban packaging bug: the default filter.d/sshd.conf hardcodes
-    # "journalmatch = _SYSTEMD_UNIT=sshd.service", but on Debian/Ubuntu the
-    # actual systemd unit is usually "ssh.service", not "sshd.service". Left
-    # as-is, fail2ban runs, reports "active", and looks fine in status output
-    # — but silently matches zero journal entries and never bans anyone.
-    # This runs every time (idempotent, no downside either way) so both
-    # fresh installs and pre-existing ones get corrected.
-    local ssh_unit="ssh.service"
-    if systemctl list-unit-files 2>/dev/null | grep -q "^sshd\.service"; then
-        ssh_unit="sshd.service"
-    fi
-    cat > /etc/fail2ban/jail.d/sshd.local <<EOF
+    # --- fail2ban ---
+    read -rp "Install/configure fail2ban (SSH brute-force protection)? [Y/n]: " CONFIRM_FAIL2BAN
+    CONFIRM_FAIL2BAN="${CONFIRM_FAIL2BAN:-Y}"
+    if [[ "$CONFIRM_FAIL2BAN" =~ ^[Yy]$ ]]; then
+        if systemctl is-active --quiet fail2ban 2>/dev/null; then
+            echo "fail2ban is already installed and running, skipping install."
+        else
+            echo "Installing fail2ban (bans IPs that repeatedly fail SSH login)..."
+            apt-get install -y -qq fail2ban || { warn "fail2ban install failed."; return 1; }
+            systemctl enable --now fail2ban
+            echo "fail2ban is active. Check it any time with: fail2ban-client status sshd"
+            echo "(A high 'Total failed' count is normal — that's internet bot noise, not you being targeted.)"
+        fi
+
+        # Known fail2ban packaging bug: the default filter.d/sshd.conf hardcodes
+        # "journalmatch = _SYSTEMD_UNIT=sshd.service", but on Debian/Ubuntu the
+        # actual systemd unit is usually "ssh.service", not "sshd.service". Left
+        # as-is, fail2ban runs, reports "active", and looks fine in status output
+        # — but silently matches zero journal entries and never bans anyone.
+        # This runs every time (idempotent, no downside either way) so both
+        # fresh installs and pre-existing ones get corrected.
+        local ssh_unit="ssh.service"
+        if systemctl list-unit-files 2>/dev/null | grep -q "^sshd\.service"; then
+            ssh_unit="sshd.service"
+        fi
+        cat > /etc/fail2ban/jail.d/sshd.local <<EOF
 [sshd]
 enabled = true
 backend = systemd
 journalmatch = _SYSTEMD_UNIT=${ssh_unit}
 EOF
-    systemctl restart fail2ban
-    echo "fail2ban's SSH journal filter verified/corrected (watching ${ssh_unit})."
+        systemctl restart fail2ban
+        echo "fail2ban's SSH journal filter verified/corrected (watching ${ssh_unit})."
+        did_fail2ban="done"
+    else
+        echo "Skipping fail2ban."
+    fi
 
     # --- UFW ---
-    if require_cmd ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
-        echo "UFW is already active, ensuring base ports are allowed..."
-    else
-        echo "Installing UFW (firewall)..."
-        apt-get install -y -qq ufw || { warn "UFW install failed."; return 1; }
-    fi
+    read -rp "Install/configure UFW (firewall)? [Y/n]: " CONFIRM_UFW
+    CONFIRM_UFW="${CONFIRM_UFW:-Y}"
+    if [[ "$CONFIRM_UFW" =~ ^[Yy]$ ]]; then
+        if require_cmd ufw && ufw status 2>/dev/null | grep -q "Status: active"; then
+            echo "UFW is already active, ensuring base ports are allowed..."
+        else
+            echo "Installing UFW (firewall)..."
+            apt-get install -y -qq ufw || { warn "UFW install failed."; return 1; }
+        fi
 
-    local p
-    for p in "${ports[@]}"; do
-        ufw allow "$p" >/dev/null 2>&1 || warn "Could not add UFW rule for port $p."
-    done
+        local p
+        for p in "${ports[@]}"; do
+            ufw allow "$p" >/dev/null 2>&1 || warn "Could not add UFW rule for port $p."
+        done
 
-    if ! ufw status 2>/dev/null | grep -q "Status: active"; then
-        # --force skips the interactive "this may disconnect SSH" prompt —
-        # safe here specifically because SSH's port (22) is guaranteed to be
-        # in $ports by the default above; if the caller overrode UFW_PORTS
-        # and dropped 22, warn loudly before enabling.
-        if [[ ! " ${ports[*]} " =~ " 22 " ]]; then
-            alert "UFW is about to be enabled but port 22 (SSH) is NOT in the allow list."
-            alert "This can lock you out of the server over SSH."
-            read -rp "Continue enabling UFW anyway? [y/N]: " CONFIRM_UFW_NO_SSH
-            if [[ ! "$CONFIRM_UFW_NO_SSH" =~ ^[Yy]$ ]]; then
-                warn "UFW left disabled. Add port 22 to UFW_PORTS and re-run."
-                setup_auto_updates || warn "Automatic security updates step did not fully complete."
-                return 1
+        if ! ufw status 2>/dev/null | grep -q "Status: active"; then
+            # --force skips the interactive "this may disconnect SSH" prompt —
+            # safe here specifically because SSH's port (22) is guaranteed to be
+            # in $ports by the default above; if the caller overrode UFW_PORTS
+            # and dropped 22, warn loudly before enabling.
+            if [[ ! " ${ports[*]} " =~ " 22 " ]]; then
+                alert "UFW is about to be enabled but port 22 (SSH) is NOT in the allow list."
+                alert "This can lock you out of the server over SSH."
+                read -rp "Continue enabling UFW anyway? [y/N]: " CONFIRM_UFW_NO_SSH
+                if [[ ! "$CONFIRM_UFW_NO_SSH" =~ ^[Yy]$ ]]; then
+                    warn "UFW left disabled. Add port 22 to UFW_PORTS and re-run."
+                    CONFIRM_UFW="n"
+                fi
             fi
         fi
-        ufw --force enable
-        echo "UFW enabled. Allowed ports: ${ports[*]}"
+
+        if [[ "$CONFIRM_UFW" =~ ^[Yy]$ ]]; then
+            if ! ufw status 2>/dev/null | grep -q "Status: active"; then
+                ufw --force enable
+                echo "UFW enabled. Allowed ports: ${ports[*]}"
+            else
+                echo "UFW already active. Allowed ports (added/confirmed): ${ports[*]}"
+            fi
+            ufw status verbose
+            did_ufw="done"
+        fi
     else
-        echo "UFW already active. Allowed ports (added/confirmed): ${ports[*]}"
+        echo "Skipping UFW."
     fi
 
-    ufw status verbose
-
-    setup_auto_updates || warn "Automatic security updates step did not fully complete."
+    # --- automatic security updates ---
+    read -rp "Install/configure automatic security updates (unattended-upgrades)? [Y/n]: " CONFIRM_UPDATES
+    CONFIRM_UPDATES="${CONFIRM_UPDATES:-Y}"
+    if [[ "$CONFIRM_UPDATES" =~ ^[Yy]$ ]]; then
+        setup_auto_updates || warn "Automatic security updates step did not fully complete."
+        did_updates="done"
+    else
+        echo "Skipping automatic security updates."
+    fi
 
     echo ""
-    echo "Hardening complete: fail2ban, UFW (${ports[*]}), automatic security updates."
+    echo "Hardening summary: fail2ban (${did_fail2ban}), UFW (${did_ufw}), automatic security updates (${did_updates})."
     return 0
 }
 
@@ -1849,7 +1880,7 @@ while true; do
     echo ""
     echo "  1) System maintenance (update, upgrade, cleanup, journal trim, history)"
     echo "  2) Check / set up swap space (auto-sized to your RAM, skips if already present)"
-    echo "  3) Harden server (fail2ban + UFW firewall + automatic security updates)"
+    echo "  3) Harden server (fail2ban / UFW / automatic security updates, each optional)"
     echo "  4) TCP congestion control (enable BBR / revert to CUBIC)"
     echo "  5) DNS-over-TLS (Cloudflare / Quad9 / custom — bypasses provider DNS)"
     echo "  6) Set up scheduled reboot (daily/weekly/monthly) + clock sync (NTP)"
