@@ -1293,15 +1293,23 @@ congestion_control_menu() {
 # Switches the host's DNS resolution to DNS-over-TLS, so provider- or
 # datacenter-assigned resolvers (e.g. a cloud host's metadata-service DNS
 # proxy) are never used, and queries are encrypted end-to-end. Touches two
-# places, verified by hand before this module was written:
+# places:
 #   - /etc/systemd/resolved.conf   (DNS=, FallbackDNS=, DNSOverTLS=yes)
-#   - /etc/netplan/*.yaml          (nameservers: + dhcp4-overrides.use-dns:
-#                                    false, so DHCP-supplied DNS is never
-#                                    even registered, not just overridden)
-# Netplan is rewritten from a template rather than patched in place - YAML's
-# indentation makes surgical edits fragile. The interface's existing lines
-# (match/macaddress, mtu, set-name, dhcp4, etc.) are extracted and preserved
-# as-is; only nameservers:/dhcp4-overrides: are added or replaced.
+#   - /etc/netplan/90-dns-toolkit.yaml   (nameservers: + dhcp4-overrides.
+#                                          use-dns: false, so DHCP-supplied
+#                                          DNS is never even registered, not
+#                                          just overridden)
+# The netplan side writes to its OWN dedicated file rather than patching
+# whatever cloud-init generated (usually 50-cloud-init.yaml) - that file is
+# rewritten by cloud-init on every boot (confirmed by hand on Ubuntu 26.04:
+# DHCP-assigned DNS was back and live on the primary interface after a
+# reboot, even though the systemd-resolved side was still correctly set).
+# Netplan merges every file under /etc/netplan/ in lexical order, so this
+# module's higher-numbered file wins on nameservers/dhcp4-overrides for the
+# same interface, and survives cloud-init doing its normal job untouched.
+# The interface's identity (match:/macaddress: block if present, otherwise
+# just the interface name) is read from the base file and mirrored into the
+# override file, so it keeps applying to the right NIC either way.
 # ============================================================
 
 # Built-in provider pairs. Picking one uses the OTHER built-in provider as
@@ -1310,39 +1318,52 @@ congestion_control_menu() {
 _DNS_CLOUDFLARE_IP1="1.1.1.1"; _DNS_CLOUDFLARE_IP2="1.0.0.1"; _DNS_CLOUDFLARE_HOST="cloudflare-dns.com"
 _DNS_QUAD9_IP1="9.9.9.9"; _DNS_QUAD9_IP2="149.112.112.112"; _DNS_QUAD9_HOST="dns.quad9.net"
 
-# Finds the netplan YAML file this module should edit. Errors out rather
-# than guessing if there's more than one, or none - ambiguous which is live.
-_dns_netplan_file() {
-    local files=(/etc/netplan/*.yaml)
-    if [[ ! -e "${files[0]}" ]]; then
-        warn "No netplan YAML file found under /etc/netplan/ - skipping netplan changes."
-        warn "(Expected on non-Ubuntu hosts. /etc/systemd/resolved.conf is still updated, so DNS"
-        warn "changes apply now - but without netplan there's nothing here stopping DHCP from"
-        warn "re-asserting its own DNS on this interface later, e.g. on the next reboot.)"
+# The toolkit's own netplan file. Deliberately NOT the cloud-init-generated
+# file (usually /etc/netplan/50-cloud-init.yaml) - that file is rewritten by
+# cloud-init on every boot (it says so in its own header comment), which
+# silently reverted this module's nameservers/dhcp4-overrides block on the
+# very first reboot after applying it (confirmed by hand: DHCP-assigned DNS
+# was back and live on the primary interface after reboot, even though
+# /etc/systemd/resolved.conf's Global scope was untouched and still correct).
+# Netplan merges every file under /etc/netplan/ in lexical order, so a HIGHER
+# numbered file wins on any key it sets for the same interface - this file's
+# nameservers/dhcp4-overrides override whatever cloud-init writes into its
+# own lower-numbered file, and cloud-init regenerating that file on every
+# boot no longer matters.
+_DNS_NETPLAN_FILE="/etc/netplan/90-dns-toolkit.yaml"
+
+# Finds whatever OTHER (non-toolkit) netplan file currently defines the
+# interface - normally cloud-init's file. This is read-only: only used to
+# copy the interface's existing identity (match/macaddress or plain name)
+# into the toolkit's own override file, never edited itself. Errors out
+# rather than guessing if there's more than one candidate, or none.
+_dns_base_netplan_file() {
+    local f files=()
+    for f in /etc/netplan/*.yaml; do
+        [[ -e "$f" ]] || continue
+        [[ "$f" == "$_DNS_NETPLAN_FILE" ]] && continue
+        files+=("$f")
+    done
+    if [[ ${#files[@]} -eq 0 ]]; then
+        warn "No netplan YAML file found under /etc/netplan/ (other than the toolkit's own) -"
+        warn "skipping netplan changes. (Expected on non-Ubuntu hosts. /etc/systemd/resolved.conf"
+        warn "is still updated, so DNS changes apply now - but without netplan there's nothing"
+        warn "here stopping DHCP from re-asserting its own DNS on this interface later.)"
         return 1
     fi
     if [[ ${#files[@]} -gt 1 ]]; then
         warn "Multiple netplan files found under /etc/netplan/: ${files[*]}"
-        warn "Not guessing which is live - edit netplan manually, or remove the extras first."
+        warn "Not guessing which one defines the interface - edit netplan manually, or remove"
+        warn "the extras first."
         return 1
     fi
     echo "${files[0]}"
 }
 
-# Rewrites the given netplan file's first ethernet interface block so that:
-#   - dhcp4-overrides: use-dns: false   (DHCP-supplied DNS never registered)
-#   - nameservers: addresses: [...]     (explicit resolver list)
-# Any other keys already on that interface (match/macaddress, mtu, set-name,
-# dhcp4, etc.) are preserved exactly as they were. Idempotent: any
-# nameservers:/dhcp4-overrides: block from a PREVIOUS run of this module is
-# stripped before the block is rebuilt, so re-running never duplicates them.
-# Prints the interface name on success (used by the caller to clear its
-# live resolver cache immediately, rather than waiting for a reboot).
 # Extracts the interface name from the first entry under 'ethernets:' in a
-# netplan YAML file. Shared by the writer (below) and by restore, so both
-# agree on which interface DNS actually applies to. Uses literal space
-# counts, not [:space:]{n} interval regex - Ubuntu's default /usr/bin/awk is
-# mawk, which doesn't support interval quantifiers without a non-default flag.
+# netplan YAML file. Uses literal space counts, not [:space:]{n} interval
+# regex - Ubuntu's default /usr/bin/awk is mawk, which doesn't support
+# interval quantifiers without a non-default flag.
 _dns_detect_iface() {
     local file="$1"
     awk '
@@ -1353,52 +1374,96 @@ _dns_detect_iface() {
     ' "$file"
 }
 
+# Extracts whatever "match:" block (usually macaddress:) the base file uses
+# to identify the interface, if any. Printed verbatim (already indented at
+# the "match:"/"macaddress:" level, i.e. 6 spaces in the base file) so it can
+# be reused as-is in the override file, which nests the interface at the
+# same depth. If the base file has no match block (plain interface name,
+# e.g. bare "eth0: dhcp4: true"), nothing is printed - the override file then
+# matches by interface name alone, same as the base file does.
+_dns_detect_match_block() {
+    local file="$1" iface="$2"
+    awk -v iface="$iface" '
+        BEGIN { in_iface=0; in_match=0 }
+        $0 ~ "^    "iface":" { in_iface=1; next }
+        in_iface && /^    [A-Za-z0-9_.-]+:/ { exit }
+        in_iface && /^      match:/ { in_match=1; print; next }
+        in_iface && in_match {
+            if ($0 ~ /^        /) { print; next }
+            in_match=0
+        }
+    ' "$file"
+}
+
+# Writes/refreshes the toolkit's own netplan override file so that:
+#   - the interface is identified the SAME way the base (cloud-init) file
+#     identifies it - match:/macaddress: block copied verbatim if present,
+#     otherwise just the bare interface name - so this file keeps applying
+#     to the right NIC even if cloud-init regenerates its own file
+#   - dhcp4-overrides: use-dns: false   (DHCP-supplied DNS never registered)
+#   - nameservers: addresses: [...]     (explicit resolver list)
+# Idempotent: the file is fully rewritten from scratch each run, so
+# re-running never duplicates anything or leaves stale state behind.
+# Prints the interface name on success (used by the caller to clear its
+# live resolver cache immediately, rather than waiting for a reboot).
 _dns_write_netplan() {
-    local file="$1" ip1="$2" ip2="$3"
-    local pristine="${file}.pre-dns-toolkit"
-    [[ -f "$pristine" ]] || cp "$file" "$pristine"
-    local backup="${file}.bak.$(date +%Y%m%d%H%M%S)"
-    cp "$file" "$backup"
+    local base_file="$1" ip1="$2" ip2="$3"
 
     local iface
-    iface=$(_dns_detect_iface "$file")
-    [[ -n "$iface" ]] || { warn "Could not find an interface under 'ethernets:' in $file - leaving it untouched."; return 1; }
+    iface=$(_dns_detect_iface "$base_file")
+    [[ -n "$iface" ]] || { warn "Could not find an interface under 'ethernets:' in $base_file - leaving netplan untouched."; return 1; }
 
-    local existing_lines
-    existing_lines=$(awk -v iface="$iface" '
-        BEGIN { in_iface=0; skip=0 }
-        $0 ~ "^    "iface":" { in_iface=1; next }
-        in_iface && /^    [A-Za-z0-9_.-]+:/ { in_iface=0 }
-        in_iface {
-            if ($0 ~ /^      (nameservers|dhcp4-overrides):/) { skip=1; next }
-            if (skip) {
-                if ($0 ~ /^        /) next
-                skip=0
-            }
-            print
-        }
-    ' "$file")
+    local match_block
+    match_block=$(_dns_detect_match_block "$base_file" "$iface")
 
     {
         echo "network:"
         echo "  version: 2"
         echo "  ethernets:"
         echo "    ${iface}:"
-        [[ -n "$existing_lines" ]] && printf '%s\n' "$existing_lines"
+        [[ -n "$match_block" ]] && printf '%s\n' "$match_block"
         echo "      dhcp4-overrides:"
         echo "        use-dns: false"
         echo "      nameservers:"
         echo "        addresses: [${ip1}, ${ip2}]"
-    } > "$file"
+    } > "$_DNS_NETPLAN_FILE"
+
+    # Netplan requires its config files to be root-only (mode 600) and warns
+    # (harmlessly, but repeatedly) otherwise - the plain '>' redirect above
+    # inherits the shell's umask instead, which is usually more permissive
+    # than netplan wants (confirmed by hand: got three "Permissions ... too
+    # open" warnings from netplan apply on a freshly-written file at the
+    # default umask). chown/chmod explicitly rather than relying on umask,
+    # since umask isn't guaranteed to be the same on every host this runs on.
+    chown root:root "$_DNS_NETPLAN_FILE"
+    chmod 600 "$_DNS_NETPLAN_FILE"
 
     echo "$iface"
 }
 
-# Sets DNS=/FallbackDNS=/DNSOverTLS=yes in /etc/systemd/resolved.conf.
+# Sets DNS=/FallbackDNS=/DNSOverTLS=yes/Domains=~. in /etc/systemd/resolved.conf.
 # Replaces any existing LIVE (uncommented) line for each key; otherwise
 # inserts a new line right after the [Resolve] header. The stock file's
 # commented example lines are left untouched either way - only real, active
 # keys are ever modified.
+#
+# Domains=~. is what actually keeps this module honest. Without it, a link
+# that ends up with its OWN per-link DNS servers registered - which happens
+# here because netplan MERGES (unions) nameservers.addresses across config
+# files rather than letting a later file replace an earlier one, so cloud-
+# init's file and this module's override file both contribute to the same
+# interface's live resolver list - can end up preferred over the Global
+# scope for ordinary queries, since systemd-resolved treats a link's own
+# servers as usable for the same "~." (root) routing domain Global also
+# serves, and tends to prefer the more specific/local scope. Confirmed by
+# hand on Ubuntu 26.04: after a reboot, eth0 showed a live per-link DNS
+# scope with the ORIGINAL plaintext DHCP/static resolver still present
+# alongside the new one, while Global correctly showed DNSOverTLS - i.e.
+# the encrypted config was present but not necessarily what was actually
+# being used. Domains=~. makes Global explicitly authoritative for every
+# domain, which is the documented fix for exactly this Global-vs-per-link
+# precedence problem, and makes the per-link merge quirk harmless rather
+# than something that has to be worked around at the netplan layer.
 _dns_write_resolved_conf() {
     local dns_line="$1" fallback_line="$2"
     local file="/etc/systemd/resolved.conf"
@@ -1410,7 +1475,7 @@ _dns_write_resolved_conf() {
     grep -q '^\[Resolve\]' "$file" || { warn "No [Resolve] section found in $file - aborting DNS changes."; return 1; }
 
     local key value
-    for pair in "DNS=$dns_line" "FallbackDNS=$fallback_line" "DNSOverTLS=yes"; do
+    for pair in "DNS=$dns_line" "FallbackDNS=$fallback_line" "DNSOverTLS=yes" "Domains=~."; do
         key="${pair%%=*}"
         value="${pair#*=}"
         [[ "$key" == "FallbackDNS" && -z "$value" ]] && continue
@@ -1422,15 +1487,19 @@ _dns_write_resolved_conf() {
     done
 }
 
-# Restores /etc/systemd/resolved.conf and the netplan file to whatever they
-# were BEFORE this module ever touched them (the "pre-dns-toolkit" copy,
-# saved once on first use - not the per-switch timestamped backups, which
-# would just restore the previous provider instead of the true original).
+# Restores /etc/systemd/resolved.conf to whatever it was BEFORE this module
+# ever touched it (the "pre-dns-toolkit" copy, saved once on first use - not
+# the per-switch timestamped backups, which would just restore the previous
+# provider instead of the true original), and removes the toolkit's own
+# netplan override file entirely. The base (cloud-init) netplan file is
+# never touched by this module in the first place, so there's nothing to
+# restore there - deleting the override file and letting netplan re-apply
+# is enough for DHCP-assigned DNS to take over again.
 restore_default_dns() {
     info "Restoring original (pre-toolkit) DNS configuration"
     local resolved_file="/etc/systemd/resolved.conf"
     local resolved_pristine="${resolved_file}.pre-dns-toolkit"
-    local nfile pristine_net restored_any=false
+    local restored_any=false
 
     if [[ -f "$resolved_pristine" ]]; then
         cp "$resolved_pristine" "$resolved_file"
@@ -1440,15 +1509,12 @@ restore_default_dns() {
         echo "No pre-toolkit backup found for $resolved_file - this module may never have changed it."
     fi
 
-    if nfile=$(_dns_netplan_file); then
-        pristine_net="${nfile}.pre-dns-toolkit"
-        if [[ -f "$pristine_net" ]]; then
-            cp "$pristine_net" "$nfile"
-            echo "Restored $nfile from its pre-toolkit backup."
-            restored_any=true
-        else
-            echo "No pre-toolkit backup found for $nfile - this module may never have changed it."
-        fi
+    if [[ -f "$_DNS_NETPLAN_FILE" ]]; then
+        rm -f "$_DNS_NETPLAN_FILE"
+        echo "Removed $_DNS_NETPLAN_FILE (the toolkit's own override - the base netplan file was never touched)."
+        restored_any=true
+    else
+        echo "No toolkit netplan override file found at $_DNS_NETPLAN_FILE - this module may never have changed it."
     fi
 
     if [[ "$restored_any" == false ]]; then
@@ -1505,6 +1571,7 @@ restore_default_dns() {
 # it should work. VERSION_ID from /etc/os-release, e.g. "24.04", "12", "13".
 _DNS_TESTED_OS_VERSIONS=(
     "ubuntu:24.04"
+    "ubuntu:26.04"
 )
 
 _dns_check_prereqs() {
@@ -1608,10 +1675,10 @@ setup_dot_dns() {
     _dns_write_resolved_conf "$dns_line" "$fallback_line" || return 1
 
     local iface=""
-    local nfile
-    if nfile=$(_dns_netplan_file); then
-        info "Updating netplan ($nfile)"
-        iface=$(_dns_write_netplan "$nfile" "$p_ip1" "${p_ip2:-$p_ip1}")
+    local base_nfile
+    if base_nfile=$(_dns_base_netplan_file); then
+        info "Writing netplan override ($_DNS_NETPLAN_FILE, base interface def read from $base_nfile)"
+        iface=$(_dns_write_netplan "$base_nfile" "$p_ip1" "${p_ip2:-$p_ip1}")
         if [[ -n "$iface" ]]; then
             echo "Applying netplan..."
             netplan apply || warn "netplan apply reported an issue - check the output above."
@@ -1633,12 +1700,33 @@ setup_dot_dns() {
     echo "=== Result ==="
     resolvectl status --no-pager
     echo ""
-    echo "Test query:"
-    resolvectl query example.com || warn "Test query failed - check the output above."
+
+    # Netplan MERGES (unions) nameservers.addresses across config files
+    # rather than letting a higher-numbered file replace a lower one - so
+    # the base (e.g. cloud-init) file's original resolvers and this
+    # module's resolvers both end up registered on the same link. After a
+    # reboot in particular, it's normal and expected for the primary
+    # interface above to show a "Current Scopes: DNS" line listing the
+    # ORIGINAL provider/DHCP resolvers (e.g. 8.8.8.8) alongside the new
+    # ones - that's cosmetic, not a sign this didn't work. Domains=~. in
+    # resolved.conf (set above) is what actually makes Global authoritative
+    # for every domain regardless of what any per-link scope shows, so the
+    # status listing is not what proves encryption is active - only an
+    # actual query does, which is why the check below runs one and checks
+    # the result, rather than asking you to eyeball the status output above.
+    echo "Test query (this, not the status above, is what actually confirms it's working):"
+    local query_output query_status
+    query_output=$(resolvectl query example.com 2>&1)
+    query_status=$?
+    echo "$query_output"
     echo ""
-    echo "Look for '+DNSOverTLS' above, and 'Data was acquired via local or encrypted"
-    echo "transport: yes' in the query result - that confirms it's actually encrypted,"
-    echo "not just configured."
+    if [[ $query_status -eq 0 ]] && grep -q "encrypted transport: yes" <<<"$query_output"; then
+        echo "PASS: resolution is going through the encrypted path (Global/DNSOverTLS), regardless"
+        echo "of which resolvers any individual link above happens to list."
+    else
+        warn "Query did not confirm encrypted transport - see output above. Encryption may not be"
+        warn "active even if the status block above looks correct; this is the check that matters."
+    fi
     return 0
 }
 

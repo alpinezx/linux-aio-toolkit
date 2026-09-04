@@ -5,7 +5,7 @@
 A single interactive script bundling common Ubuntu/Debian VPS setup and maintenance tasks — the stuff you'd otherwise do by hand every time you log into a fresh server, or hunt down in a pile of separate one-off scripts.
 
 > **⚠️ Compatibility notice**
-> This toolkit is tested end-to-end only on **Ubuntu Server 24.04 LTS**. It has *not* been verified on Debian (12/13) or other Ubuntu releases (e.g. 26.04) yet. Most modules are plain `apt`/`systemd` operations likely to work fine elsewhere — but the **DNS-over-TLS** module specifically relies on Ubuntu-specific behavior (netplan, systemd-networkd) that may not exist or may work differently on other distros/versions. That module checks its own compatibility at runtime and will warn and ask for confirmation before running on anything outside its tested list — see [Safety design](#safety-design).
+> This toolkit is tested end-to-end on **Ubuntu Server 24.04 LTS** and **26.04 LTS**. It has *not* been verified on Debian (12/13) yet. Most modules are plain `apt`/`systemd` operations likely to work fine elsewhere — but the **DNS-over-TLS** module specifically relies on Ubuntu-specific behavior (netplan, systemd-networkd) that may not exist or may work differently on other distros/versions. That module checks its own compatibility at runtime and will warn and ask for confirmation before running on anything outside its tested list — see [Safety design](#safety-design).
 >
 > Use on other distros/versions at your own risk. PRs adding verified support for additional OS/version combos are welcome.
 
@@ -18,7 +18,7 @@ A single interactive script bundling common Ubuntu/Debian VPS setup and maintena
 
 ## Prerequisites
 
-- A fresh Ubuntu or Debian VPS (tested on Ubuntu Server 24.04 LTS; should work on other Debian-based distros, but paths/behavior may differ slightly — see the compatibility notice above)
+- A fresh Ubuntu or Debian VPS (tested on Ubuntu Server 24.04 LTS and 26.04 LTS; should work on other Debian-based distros, but paths/behavior may differ slightly — see the compatibility notice above)
 - Root access, or a sudo-capable user
 
 ## Quick start
@@ -57,7 +57,7 @@ A quick rundown of what each does:
 - **Swap** — detects RAM, recommends a size (2x under 1GB, 1x from 1–8GB, flat 4GB above), capped at 25% of free disk. Skips cleanly if swap already exists.
 - **Harden server** — fail2ban (with the `ssh.service` vs `sshd.service` unit-detection fix baked in), UFW with base ports (22/80/443 by default, override via `UFW_PORTS`), and unattended-upgrades (security patches only, no auto-reboot).
 - **BBR** — switches TCP congestion control from CUBIC to BBR + fq qdisc, lets you test live before persisting across reboots.
-- **DNS-over-TLS** — switches the host to encrypted DNS (Cloudflare, Quad9, or a custom resolver), so a provider- or datacenter-assigned resolver (e.g. a cloud host's DHCP-served DNS) is never used in plaintext. Writes both `/etc/systemd/resolved.conf` and netplan (so DHCP can't silently reassert its own DNS later), and includes a one-click **Restore** back to the exact pre-toolkit configuration — no reboot required, even though the underlying fix (a `systemd-networkd` restart, to work around a documented DHCP/DNS propagation quirk) took real trial-and-error to land on. Ubuntu/netplan-specific; see the compatibility notice above.
+- **DNS-over-TLS** — switches the host to encrypted DNS (Cloudflare, Quad9, or a custom resolver), so a provider- or datacenter-assigned resolver (e.g. a cloud host's DHCP-served DNS) is never used in plaintext. Writes `/etc/systemd/resolved.conf` directly, and writes netplan config to its **own dedicated file** (`/etc/netplan/90-dns-toolkit.yaml`) rather than editing whatever generated the base config — on cloud images that's usually cloud-init, which rewrites its own file on every boot, so a direct edit there gets silently reverted at the next reboot. Also sets `Domains=~.` so the encrypted resolver stays authoritative for all lookups even though netplan itself merges (unions) nameserver lists across config files rather than one replacing another, meaning the original provider/DHCP resolvers will still show up listed alongside the new ones in `resolvectl status` — that's expected, and the module's own post-apply check confirms actual encrypted resolution directly rather than relying on that display. Includes a one-click **Restore** back to the exact pre-toolkit configuration — no reboot required, even though the underlying fix (a `systemd-networkd` restart, to work around a documented DHCP/DNS propagation quirk) took real trial-and-error to land on. Ubuntu/netplan-specific; see the compatibility notice above.
 - **Scheduled reboot** — optional timezone change, a daily reboot cron job at a time you choose, and NTP sync via systemd-timesyncd so the schedule doesn't drift.
 - **Check root SSH login status** — read-only. Shows the raw `PermitRootLogin`/`PasswordAuthentication` settings in every file sshd actually reads (not just the obvious one), plus the final merged value.
 - **Create a non-root sudo user** — `adduser`, adds to the `sudo` group, copies root's own SSH key over so they can log in immediately.
