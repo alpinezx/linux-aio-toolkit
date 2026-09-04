@@ -1868,15 +1868,37 @@ setup_scheduled_reboot() {
     # --- NTP / clock sync ---
     echo ""
     info "Clock synchronization (keeps the reboot time accurate over the long run)"
+    local had_chrony=false
+    dpkg -s chrony >/dev/null 2>&1 && had_chrony=true
     if dpkg -s systemd-timesyncd >/dev/null 2>&1; then
         echo "systemd-timesyncd already installed."
     else
         echo "Installing systemd-timesyncd..."
+        [[ "$had_chrony" == true ]] && echo "(chrony is currently installed and will be removed - it and systemd-timesyncd can't coexist, they both claim the same time-sync D-Bus interface.)"
         apt-get update -qq || warn "apt update failed — continuing, install may use stale package lists."
         apt-get install -y -qq systemd-timesyncd || { warn "systemd-timesyncd install failed."; return 1; }
     fi
+
+    # Removing one time-daemon and installing another in the SAME apt
+    # transaction (which is what happens whenever chrony was already
+    # present, e.g. Ubuntu 26.04 cloud images ship it by default - 24.04
+    # images generally didn't, which is why this wasn't seen there) can
+    # leave systemd's own unit cache stale for a moment: timedatectl asks
+    # systemd-timedated for the NTP-capable unit, and that lookup can lose
+    # the race against the just-finished package transaction, reporting
+    # "Failed to set ntp: NTP not supported" even though the timesyncd unit
+    # is now correctly installed and enabled. A daemon-reload plus one retry
+    # closes that window rather than leaving clock sync silently disabled.
+    systemctl daemon-reload
     systemctl enable --now systemd-timesyncd >/dev/null 2>&1 || true
-    timedatectl set-ntp true
+
+    if ! timedatectl set-ntp true 2>/dev/null; then
+        warn "First attempt to enable NTP sync didn't take - retrying after a daemon-reload"
+        warn "(this can happen when chrony had to be removed first to make way for systemd-timesyncd)."
+        systemctl daemon-reload
+        sleep 2
+        timedatectl set-ntp true || warn "NTP sync still not enabling - check 'systemctl status systemd-timesyncd' by hand."
+    fi
 
     echo ""
     timedatectl | grep -E "synchronized|NTP service|Time zone" || timedatectl
