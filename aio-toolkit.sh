@@ -210,10 +210,18 @@ harden_server() {
         # — but silently matches zero journal entries and never bans anyone.
         # This runs every time (idempotent, no downside either way) so both
         # fresh installs and pre-existing ones get corrected.
-        local ssh_unit="ssh.service"
-        if systemctl list-unit-files 2>/dev/null | grep -q "^sshd\.service"; then
-            ssh_unit="sshd.service"
-        fi
+        # Ask systemd for the unit's real name rather than looking for
+        # "sshd.service" in the unit list: on Debian 13 and Ubuntu 24.04 that
+        # name is only an alias of ssh.service, and the journal files SSH's
+        # messages under the real name, so matching the alias catches nothing.
+        local ssh_unit="" u
+        for u in ssh.service sshd.service; do
+            if [[ "$(systemctl show -p LoadState --value "$u" 2>/dev/null)" == loaded ]]; then
+                ssh_unit=$(systemctl show -p Id --value "$u" 2>/dev/null)
+                break
+            fi
+        done
+        [[ "$ssh_unit" == *.service ]] || ssh_unit="ssh.service"
         cat > /etc/fail2ban/jail.d/sshd.local <<EOF
 [sshd]
 enabled = true
