@@ -162,9 +162,10 @@ EOF
     systemctl enable --now unattended-upgrades >/dev/null 2>&1 || true
 
     echo "Automatic security updates are ON (checked daily, security patches only)."
-    echo "Note: kernel patches still need an eventual reboot to take effect — if you"
-    echo "see '*** System restart required ***' when logging in, run 'sudo reboot'"
-    echo "at a convenient moment."
+    echo "Note: kernel patches still need an eventual reboot to take effect. Option 1"
+    echo "(System maintenance) says when one is needed, on Ubuntu and Debian alike;"
+    echo "Ubuntu also shows '*** System restart required ***' when you log in."
+    echo "Then run 'sudo reboot' at a convenient moment."
     return 0
 }
 
@@ -441,6 +442,20 @@ _clear_shell_history() {
     echo "log out, or run 'history -c' yourself in that shell."
 }
 
+# Whether a reboot would finish installing updates. Ubuntu writes
+# /var/run/reboot-required; Debian doesn't, so a kernel installed since the
+# last boot counts too (its file's change time is when it was installed).
+_reboot_needed() {
+    [[ -f /var/run/reboot-required ]] && return 0
+    local boot f
+    boot=$(awk '/^btime /{print $2}' /proc/stat 2>/dev/null)
+    [[ "$boot" =~ ^[0-9]+$ ]] || return 1
+    for f in /boot/vmlinuz-*; do
+        [[ -e "$f" ]] && (( $(stat -c %Z "$f" 2>/dev/null || echo 0) > boot )) && return 0
+    done
+    return 1
+}
+
 system_maintenance() {
     info "System maintenance"
 
@@ -504,7 +519,7 @@ system_maintenance() {
 
     # --- reboot-required check ---
     echo ""
-    if [[ -f /var/run/reboot-required ]]; then
+    if _reboot_needed; then
         warn "A reboot is required (usually a kernel or core library update)."
         if [[ -f /var/run/reboot-required.pkgs ]]; then
             echo "Packages requiring it:"
